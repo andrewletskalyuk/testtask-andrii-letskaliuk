@@ -19,46 +19,38 @@ public class MarketService : IMarketService
 
     public async Task BuyAsync(int userId, int itemId)
     {
-        try
+        using var transaction = await _testDbContext.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+
+        var user = await _testDbContext.Users.FirstOrDefaultAsync(n => n.Id == userId);
+
+        if (user == null)
+            throw new Exception("User not found");
+
+        var item = await _testDbContext.Items.FirstOrDefaultAsync(n => n.Id == itemId);
+        if (item == null)
+            throw new Exception("Item not found");
+
+        if (user.Balance < item.Cost)
+            throw new Exception("Not enough balance");
+
+        var existingPurchase = await _testDbContext.UserItems
+            .AsNoTracking()
+            .FirstOrDefaultAsync(ui => ui.UserId == userId && ui.ItemId == itemId);
+
+        if (existingPurchase != null)
+            throw new Exception("Item already purchased.");
+
+        user.Balance -= item.Cost;
+
+        await _testDbContext.UserItems.AddAsync(new UserItem
         {
-            using var transaction = await _testDbContext.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+            UserId = userId,
+            ItemId = itemId,
+            PurchaseDate = DateTime.UtcNow, //added after migration
+        });
 
-            var user = await _testDbContext.Users.FirstOrDefaultAsync(n => n.Id == userId);
-
-            if (user == null)
-                throw new Exception("User not found");
-
-            var item = await _testDbContext.Items.FirstOrDefaultAsync(n => n.Id == itemId);
-            if (item == null)
-                throw new Exception("Item not found");
-
-            if (user.Balance < item.Cost)
-                throw new Exception("Not enough balance");
-
-            var existingPurchase = await _testDbContext.UserItems
-                .AsNoTracking()
-                .FirstOrDefaultAsync(ui => ui.UserId == userId && ui.ItemId == itemId);
-
-            if (existingPurchase != null)
-                throw new Exception("Item already purchased.");
-
-            user.Balance -= item.Cost;
-
-            await _testDbContext.UserItems.AddAsync(new UserItem
-            {
-                UserId = userId,
-                ItemId = itemId,
-                PurchaseDate = DateTime.UtcNow, //added after migration
-            });
-
-            await transaction.CommitAsync();
-            await _testDbContext.SaveChangesAsync();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error occurred during purchase operation.");
-            throw;
-        }
+        await transaction.CommitAsync();
+        await _testDbContext.SaveChangesAsync();
     }
 
     public async Task<IEnumerable<object>> GetUserPurchasesForTodayAsync(int userId)
@@ -82,27 +74,31 @@ public class MarketService : IMarketService
 
     public async Task<IEnumerable<object>> GetTopPopularItemsPerYearAsync()
     {
-        var result = await _testDbContext.UserItems
-                .GroupBy(ui => new { ui.PurchaseDate.Year, ui.ItemId, ui.Item.Name, ui.PurchaseDate.Date }) 
-                .Select(g => new
-                {
-                    Year = g.Key.Year,
-                    ItemId = g.Key.ItemId,
-                    ItemName = g.Key.Name,
-                    Date = g.Key.Date,
-                    TotalPurchases = g.Count()
-                })
-                .GroupBy(g => new { g.Year, g.ItemId, g.ItemName }) 
-                .Select(g => new
-                {
-                    Year = g.Key.Year,
-                    ItemName = g.Key.ItemName,
-                    MaxPurchasesOnSingleDay = g.Max(x => x.TotalPurchases) 
-                })
-                .OrderByDescending(g => g.MaxPurchasesOnSingleDay) 
-                .GroupBy(g => g.Year)
-                .SelectMany(g => g.Take(3)) 
-                .ToListAsync();
+        var data = await _testDbContext.UserItems
+            .Include(ui => ui.Item)
+            .Select(ui => new
+            {
+                Year = ui.PurchaseDate.Year,
+                ItemId = ui.ItemId,
+                ItemName = ui.Item.Name,
+                PurchaseDate = ui.PurchaseDate.Date
+            })
+            .ToListAsync();
+
+        var result = data
+            .GroupBy(ui => new { ui.Year, ui.ItemId, ui.ItemName })
+            .Select(g => new
+            {
+                Year = g.Key.Year,
+                ItemName = g.Key.ItemName,
+                MaxPurchasesOnSingleDay = g
+                    .GroupBy(x => x.PurchaseDate)
+                    .Max(x => x.Count())
+            })
+            .OrderByDescending(g => g.MaxPurchasesOnSingleDay)
+            .GroupBy(g => g.Year)
+            .SelectMany(g => g.Take(3))
+            .ToList();
 
         return result;
     }
